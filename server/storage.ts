@@ -1,11 +1,34 @@
-import { type User, type InsertUser, type Wish, type InsertWish } from "@shared/schema";
 import { randomUUID } from "crypto";
+import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/node-postgres";
+import pg from "pg";
+import {
+  users,
+  wishes,
+  type InsertUser,
+  type InsertWish,
+  type User,
+  type Wish,
+} from "@shared/schema";
+
+const { Pool } = pg;
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL, ensure the database is provisioned");
+}
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
+pool.on("error", (error) => {
+  console.error("idle pg client error", error);
+});
+
+const db = drizzle(pool);
 
 export interface IStorage {
   getUser(id: string): Promise<User | undefined>;
   getUserByUsername(username: string): Promise<User | undefined>;
   createUser(user: InsertUser): Promise<User>;
-  
+
   getAllWishes(): Promise<Wish[]>;
   getWish(id: string): Promise<Wish | undefined>;
   createWish(wish: InsertWish): Promise<Wish>;
@@ -14,154 +37,65 @@ export interface IStorage {
   deleteCompletedWishes(): Promise<number>;
 }
 
-export class MemStorage implements IStorage {
-  private users: Map<string, User>;
-  private wishes: Map<string, Wish>;
-
-  constructor() {
-    this.users = new Map();
-    this.wishes = new Map();
-    
-    this.seedWishes();
-  }
-
-  private seedWishes() {
-    const sampleWishes: Wish[] = [
-      {
-        id: randomUUID(),
-        title: "PlayStation 5",
-        description: "To play co-op games together on cozy evenings",
-        imageUrl: "https://images.unsplash.com/photo-1606144042614-b2417e99c4e3?w=800&auto=format&fit=crop&q=60",
-        category: "games",
-        priority: "medium",
-        owner: "draven",
-        isCompleted: false,
-      },
-      {
-        id: randomUUID(),
-        title: "Matching Couple Rings",
-        description: "Silver bands with our initials engraved inside",
-        imageUrl: null,
-        category: "products",
-        priority: "high",
-        owner: "ours",
-        isCompleted: true,
-      },
-      {
-        id: randomUUID(),
-        title: "Build a Lego Set Together",
-        description: "The big Hogwarts Castle set for weekend project",
-        imageUrl: "https://images.unsplash.com/photo-1587654780291-39c9404d746b?w=800&auto=format&fit=crop&q=60",
-        category: "collections",
-        priority: "high",
-        owner: "ours",
-        isCompleted: false,
-      },
-      {
-        id: randomUUID(),
-        title: "Start a Garden",
-        description: "Plant flowers and vegetables on our balcony",
-        imageUrl: null,
-        category: "plans",
-        priority: "high",
-        owner: "ours",
-        isCompleted: false,
-      },
-      {
-        id: randomUUID(),
-        title: "Stardew Valley Co-op",
-        description: "Build a farm together in the game",
-        imageUrl: null,
-        category: "games",
-        priority: "low",
-        owner: "clairine",
-        isCompleted: true,
-      },
-      {
-        id: randomUUID(),
-        title: "Trip to Japan",
-        description: "Visit Tokyo and Kyoto during cherry blossom season",
-        imageUrl: "https://images.unsplash.com/photo-1493976040374-85c8e12f0c0e?w=800&auto=format&fit=crop&q=60",
-        category: "travel",
-        priority: "high",
-        owner: "ours",
-        isCompleted: false,
-      },
-    ];
-
-    sampleWishes.forEach((wish) => {
-      this.wishes.set(wish.id, wish);
-    });
-  }
-
+export class DbStorage implements IStorage {
   async getUser(id: string): Promise<User | undefined> {
-    return this.users.get(id);
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
   }
 
   async getUserByUsername(username: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(
-      (user) => user.username === username,
-    );
+    const [user] = await db.select().from(users).where(eq(users.username, username));
+    return user;
   }
 
   async createUser(insertUser: InsertUser): Promise<User> {
-    const id = randomUUID();
-    const user: User = { ...insertUser, id };
-    this.users.set(id, user);
+    const [user] = await db
+      .insert(users)
+      .values({ ...insertUser, id: randomUUID() })
+      .returning();
     return user;
   }
 
   async getAllWishes(): Promise<Wish[]> {
-    return Array.from(this.wishes.values());
+    return db.select().from(wishes);
   }
 
   async getWish(id: string): Promise<Wish | undefined> {
-    return this.wishes.get(id);
+    const [wish] = await db.select().from(wishes).where(eq(wishes.id, id));
+    return wish;
   }
 
   async createWish(insertWish: InsertWish): Promise<Wish> {
-    const id = randomUUID();
-    const wish: Wish = {
-      id,
-      title: insertWish.title,
-      description: insertWish.description ?? null,
-      imageUrl: insertWish.imageUrl ?? null,
-      category: insertWish.category ?? "products",
-      priority: insertWish.priority ?? "medium",
-      owner: insertWish.owner ?? "draven",
-      isCompleted: insertWish.isCompleted ?? false,
-    };
-    this.wishes.set(id, wish);
+    const [wish] = await db
+      .insert(wishes)
+      .values({
+        id: randomUUID(),
+        title: insertWish.title,
+        description: insertWish.description ?? null,
+        imageUrl: insertWish.imageUrl ?? null,
+        category: insertWish.category ?? "products",
+        priority: insertWish.priority ?? "medium",
+        owner: insertWish.owner ?? "draven",
+        isCompleted: insertWish.isCompleted ?? false,
+      })
+      .returning();
     return wish;
   }
 
   async updateWish(id: string, updates: Partial<InsertWish>): Promise<Wish | undefined> {
-    const wish = this.wishes.get(id);
-    if (!wish) return undefined;
-
-    const updatedWish: Wish = {
-      ...wish,
-      ...updates,
-    };
-    this.wishes.set(id, updatedWish);
-    return updatedWish;
+    const [wish] = await db.update(wishes).set(updates).where(eq(wishes.id, id)).returning();
+    return wish;
   }
 
   async deleteWish(id: string): Promise<boolean> {
-    return this.wishes.delete(id);
+    const rows = await db.delete(wishes).where(eq(wishes.id, id)).returning();
+    return rows.length > 0;
   }
 
   async deleteCompletedWishes(): Promise<number> {
-    let count = 0;
-    const entries = Array.from(this.wishes.entries());
-    for (const [id, wish] of entries) {
-      if (wish.isCompleted) {
-        this.wishes.delete(id);
-        count++;
-      }
-    }
-    return count;
+    const rows = await db.delete(wishes).where(eq(wishes.isCompleted, true)).returning();
+    return rows.length;
   }
 }
 
-export const storage = new MemStorage();
+export const storage = new DbStorage();
