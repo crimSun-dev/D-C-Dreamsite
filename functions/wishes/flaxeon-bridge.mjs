@@ -1,10 +1,14 @@
 /**
  * Dreamsite -> F.L.A.X.E.O.N memory bridge.
  *
- * Every wish the Dreamsite saves is mirrored into F.L.A.X.E.O.N's canonical
- * memory store (its Neon table `memory_facts`, category `wishes`). That is the
- * table F.L.A.X.E.O.N's memory_manager reads on every load, so a new wish shows
- * up in its memory and on SPARK SOL's map without anything else running.
+ * F.L.A.X.E.O.N's memory mirrors the Dreamsite exactly, at the moment of each
+ * request: the write to F.L.A.X.E.O.N's Neon `memory_facts` table (category
+ * `wishes`) finishes before the Dreamsite answers.
+ *
+ *   wish added      -> memory created
+ *   wish edited     -> memory rewritten (details, priority, completed ...)
+ *   renamed / moved -> old memory deleted, new one created
+ *   wish removed    -> memory deleted
  *
  * Wishes are grouped by owner, with the labels the site already uses:
  *   draven   -> wishes/dravens_wish_<title>    "Draven's Wish: ..."
@@ -14,12 +18,14 @@
  * SPARK SOL links two stars when one star's text contains another fact's value
  * word for word. So every wish names its group hub ("Draven's Wish" /
  * "Clairine's Wish" / "Our Dreams") and its people ("Draven" is identity/name,
- * "Clairine" is relationships/clairine). Those anchor facts are inserted only
- * when missing, never overwritten.
+ * "Clairine" is relationships/clairine). Those anchors are inserted only when
+ * missing, never overwritten.
  *
- * A deleted wish is marked "removed from the Dreamsite", not deleted:
- * F.L.A.X.E.O.N pushes facts that exist only in its local cache back up to
- * Neon, so a hard DELETE would come back. A newer cloud value always wins.
+ * Deletes also write a tombstone into the `forgotten_facts` document. F.L.A.X.E.O.N
+ * pushes facts that only its local cache still holds back up to Neon; its
+ * memory_manager reads this document and drops those facts instead. Re-adding
+ * a wish clears its tombstone. Each change is one SQL statement, so the fact
+ * and its tombstone can never disagree.
  *
  * Config: FLAXEON_NEON_URL = F.L.A.X.E.O.N's Neon connection string (an env
  * var / secret, never committed). Unset -> the bridge does nothing.
@@ -28,6 +34,7 @@
  */
 
 const CATEGORY = "wishes";
+const TOMBSTONES = "forgotten_facts";
 const TIMEOUT_MS = 6000;
 
 const OWNERS = {
@@ -43,13 +50,27 @@ const ANCHORS = [
   ["relationships", "clairine", "Clairine"],
 ];
 
-const UPSERT =
-  "INSERT INTO memory_facts (category, key, value, updated_at) VALUES ($1, $2, $3, now()) " +
-  "ON CONFLICT (category, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now() " +
-  "WHERE memory_facts.value IS DISTINCT FROM EXCLUDED.value";
 const INSERT_IF_MISSING =
   "INSERT INTO memory_facts (category, key, value, updated_at) VALUES ($1, $2, $3, now()) " +
   "ON CONFLICT (category, key) DO NOTHING";
+
+// Save a wish and clear any tombstone for it ($1 category, $2 key, $3 value).
+const SAVE =
+  `WITH revive AS (
+     UPDATE memory_documents SET payload = payload - ($1 || '/' || $2), updated_at = now()
+     WHERE name = '${TOMBSTONES}' AND payload ? ($1 || '/' || $2))
+   INSERT INTO memory_facts (category, key, value, updated_at) VALUES ($1, $2, $3, now())
+   ON CONFLICT (category, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+   WHERE memory_facts.value IS DISTINCT FROM EXCLUDED.value`;
+
+// Delete a wish's memory and record the delete ($1 category, $2 key).
+const DELETE =
+  `WITH tomb AS (
+     INSERT INTO memory_documents (name, payload, updated_at)
+     VALUES ('${TOMBSTONES}', jsonb_build_object($1 || '/' || $2, now()), now())
+     ON CONFLICT (name) DO UPDATE
+       SET payload = memory_documents.payload || EXCLUDED.payload, updated_at = now())
+   DELETE FROM memory_facts WHERE category = $1 AND key = $2`;
 
 let anchorsDone = false;
 
@@ -99,7 +120,7 @@ export function memoryKey(wish) {
   return ownerOf(wish).keyPrefix + slug(wish.title);
 }
 
-export function describe(wish, status) {
+export function describe(wish) {
   const o = ownerOf(wish);
   const head = o === OWNERS.ours ? `${o.label} (${o.people})` : o.label;
   const parts = [`${head}: ${wish.title}`];
@@ -108,22 +129,24 @@ export function describe(wish, status) {
   parts.push(`Category: ${wish.category || "products"}`);
   parts.push(`Priority: ${wish.priority || "medium"}`);
   parts.push("Listed on the Dreamsite");
-  parts.push(`Status: ${status || (wish.isCompleted ? "completed (wish came true)" : "still wished for")}`);
+  parts.push(`Status: ${wish.isCompleted ? "completed (wish came true)" : "still wished for"}`);
   if (wish.imageUrl) parts.push(`Image: ${wish.imageUrl}`);
   return parts.join(". ").replace(/\.\./g, ".");
 }
 
-async function write(writes) {
+/** ops: [["save", key, value] | ["delete", key]] in order. */
+async function apply(ops) {
   const url = dsn();
-  if (!url) return false;
+  if (!url || !ops.length) return false;
   try {
     if (!anchorsDone) {
       for (const [cat, key, value] of ANCHORS) await runSql(url, INSERT_IF_MISSING, [cat, key, value]);
       anchorsDone = true;
     }
-    for (const [key, value] of writes) {
-      await runSql(url, UPSERT, [CATEGORY, key, value]);
-      log(`saved ${CATEGORY}/${key}`);
+    for (const [op, key, value] of ops) {
+      if (op === "save") await runSql(url, SAVE, [CATEGORY, key, value]);
+      else await runSql(url, DELETE, [CATEGORY, key]);
+      log(`${op === "save" ? "saved" : "deleted"} ${CATEGORY}/${key}`);
     }
     return true;
   } catch (e) {
@@ -134,28 +157,22 @@ async function write(writes) {
 
 /**
  * A wish was created or changed. Pass `previous` on updates: when the title or
- * owner changed, the old star is kept and says where the wish went.
+ * owner changed, the old memory is deleted and the new one created.
  */
 export function syncWish(wish, previous) {
   if (!wish) return Promise.resolve(false);
-  const writes = [];
-  if (previous && memoryKey(previous) !== memoryKey(wish)) {
-    writes.push([memoryKey(previous),
-      `${describe(previous, `moved on the Dreamsite to ${ownerOf(wish).label}: ${wish.title}`)}`]);
-  }
-  writes.push([memoryKey(wish), describe(wish)]);
-  return write(writes);
+  const ops = [];
+  if (previous && memoryKey(previous) !== memoryKey(wish)) ops.push(["delete", memoryKey(previous)]);
+  ops.push(["save", memoryKey(wish), describe(wish)]);
+  return apply(ops);
 }
 
-/** Wishes were deleted from the Dreamsite. */
+/** Wishes were deleted from the Dreamsite: their memories go too. */
 export function removeWishes(list) {
-  const day = new Date().toISOString().slice(0, 10);
-  const writes = (list || []).filter(Boolean)
-    .map((w) => [memoryKey(w), describe(w, `removed from the Dreamsite on ${day}`)]);
-  return writes.length ? write(writes) : Promise.resolve(false);
+  return apply((list || []).filter(Boolean).map((w) => ["delete", memoryKey(w)]));
 }
 
-/** Every wish already listed (e.g. a one-off backfill). */
+/** Every wish currently listed (a one-off backfill). */
 export function syncAll(list) {
-  return write((list || []).filter(Boolean).map((w) => [memoryKey(w), describe(w)]));
+  return apply((list || []).filter(Boolean).map((w) => ["save", memoryKey(w), describe(w)]));
 }
