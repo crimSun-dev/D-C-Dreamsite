@@ -1,4 +1,5 @@
 import pg from "pg";
+import { syncWish, removeWishes } from "./flaxeon-bridge.mjs";
 
 const { Pool } = pg;
 
@@ -110,11 +111,16 @@ export default async function handler(request) {
          RETURNING id, title, description, image_url, category, priority, owner, is_completed`,
         [id, wish.title, wish.description, wish.imageUrl, wish.category, wish.priority, wish.owner, wish.isCompleted],
       );
-      return json(request, mapWish(rows[0]), 201);
+      const created = mapWish(rows[0]);
+      await syncWish(created);
+      return json(request, created, 201);
     }
 
     if (method === "DELETE" && rest === "/completed/all") {
-      const { rowCount } = await pool.query("DELETE FROM wishes WHERE is_completed = true");
+      const { rows, rowCount } = await pool.query(
+        "DELETE FROM wishes WHERE is_completed = true RETURNING id, title, description, image_url, category, priority, owner, is_completed",
+      );
+      await removeWishes(rows.map(mapWish));
       return json(request, { deleted: rowCount ?? 0 });
     }
 
@@ -148,12 +154,18 @@ export default async function handler(request) {
          RETURNING id, title, description, image_url, category, priority, owner, is_completed`,
         [id, next.title, next.description ?? null, next.imageUrl ?? null, next.category, next.priority, next.owner, Boolean(next.isCompleted)],
       );
-      return json(request, mapWish(rows[0]));
+      const updated = mapWish(rows[0]);
+      await syncWish(updated, existing);
+      return json(request, updated);
     }
 
     if (method === "DELETE") {
-      const { rowCount } = await pool.query("DELETE FROM wishes WHERE id = $1", [id]);
+      const { rows, rowCount } = await pool.query(
+        "DELETE FROM wishes WHERE id = $1 RETURNING id, title, description, image_url, category, priority, owner, is_completed",
+        [id],
+      );
       if (!rowCount) return json(request, { error: "Wish not found" }, 404);
+      await removeWishes(rows.map(mapWish));
       return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
 

@@ -10,6 +10,8 @@ import {
   type User,
   type Wish,
 } from "@shared/schema";
+// Mirrors every wish into F.L.A.X.E.O.N's memory (no-op unless FLAXEON_NEON_URL is set).
+import { removeWishes, syncWish } from "../functions/wishes/flaxeon-bridge.mjs";
 
 const { Pool } = pg;
 
@@ -79,21 +81,26 @@ export class DbStorage implements IStorage {
         isCompleted: insertWish.isCompleted ?? false,
       })
       .returning();
+    await syncWish(wish);
     return wish;
   }
 
   async updateWish(id: string, updates: Partial<InsertWish>): Promise<Wish | undefined> {
+    const [previous] = await db.select().from(wishes).where(eq(wishes.id, id));
     const [wish] = await db.update(wishes).set(updates).where(eq(wishes.id, id)).returning();
+    if (wish) await syncWish(wish, previous);
     return wish;
   }
 
   async deleteWish(id: string): Promise<boolean> {
     const rows = await db.delete(wishes).where(eq(wishes.id, id)).returning();
+    await removeWishes(rows);
     return rows.length > 0;
   }
 
   async deleteCompletedWishes(): Promise<number> {
     const rows = await db.delete(wishes).where(eq(wishes.isCompleted, true)).returning();
+    await removeWishes(rows);
     return rows.length;
   }
 }
